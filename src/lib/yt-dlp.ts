@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
-import { existsSync, chmodSync, createWriteStream, copyFileSync } from "node:fs";
+import { existsSync, chmodSync, createWriteStream, statSync, mkdirSync } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import ffmpegStatic from "ffmpeg-static";
 import type { Extraction, MediaFormat } from "./store";
 
 const YTDLP_RELEASE_URL =
@@ -48,19 +49,9 @@ async function downloadBinary(): Promise<string> {
   return downloadPromise;
 }
 
-/**
- * On Vercel Serverless Functions:
- * 1. The filesystem outside of `/tmp` is strictly READ-ONLY.
- * 2. Bundled files in `./bin/yt-dlp` cannot be chmod'd in place.
- * 3. Therefore, if a bundled candidate exists, we copy it to `/tmp/yt-dlp`
- *    and chmod it there (where write + execute permissions exist).
- */
 export async function resolveBinary(): Promise<string> {
-  if (resolvedBin && existsSync(resolvedBin)) {
-    return resolvedBin;
-  }
+  if (resolvedBin && existsSync(resolvedBin)) return resolvedBin;
 
-  // Already staged in /tmp?
   if (existsSync(TMP_BIN)) {
     tryChmod(TMP_BIN);
     resolvedBin = TMP_BIN;
@@ -76,14 +67,13 @@ export async function resolveBinary(): Promise<string> {
 
   for (const c of candidates) {
     if (existsSync(c)) {
-      // First try to chmod in place (works in normal Node environments)
       if (tryChmod(c)) {
         resolvedBin = c;
         return c;
       }
-      // If chmod failed (read-only filesystem on Vercel), copy to /tmp and chmod there
       try {
-        copyFileSync(c, TMP_BIN);
+        const fs = await import("node:fs/promises");
+        await fs.copyFile(c, TMP_BIN);
         tryChmod(TMP_BIN);
         resolvedBin = TMP_BIN;
         return TMP_BIN;
@@ -93,7 +83,6 @@ export async function resolveBinary(): Promise<string> {
     }
   }
 
-  // Fallback: download directly into /tmp at runtime
   const bin = await downloadBinary();
   resolvedBin = bin;
   return bin;
@@ -115,6 +104,54 @@ export function platformFromUrl(url: string): string {
   } catch {
     return "Unknown";
   }
+}
+
+export function ensureMergedMediaFile(extraction: Extraction, fmt: MediaFormat): string | null {
+  if (!fmt || !extraction || !fmt.url) return null;
+  if (fmt.type === "image") return null;
+  const base = path.join("/tmp", `merge-${extraction.id}-${fmt.ext}`);
+  return existsSync(base) ? base : null;
+}
+
+export function ensureSingleMediaFile(extraction: Extraction, fmt: MediaFormat): string | null {
+  if (!fmt || !extraction || !fmt.url) return null;
+  const base = path.join("/tmp", `single-${extraction.id}-${fmt.ext}`);
+  return existsSync(base) ? base : null;
+}
+
+export function fetchInvidiousExtraction(id: string, url: string): Promise<Extraction | null> {
+  return new Promise(async (resolve) => {
+    try {
+      const endpoint = "https://invidious.nerdvpn.de/api/v1/search?q=" + encodeURIComponent(url);
+      const res = await fetch(endpoint, { headers: { Accept: "application/json" } });
+      if (!res.ok) return resolve(null);
+      const data = await res.json();
+      const item = Array.isArray(data) ? data[0] : null;
+      if (!item) return resolve(null);
+
+      const fallback: Extraction = {
+        id,
+        sourceUrl: url,
+        title: String(item.title || "Invidious video"),
+        thumbnail: item.videoThumbnails?.[0]?.url,
+        duration: typeof item.lengthSeconds === "number" ? Number(item.lengthSeconds) : undefined,
+        uploader: item.author,
+        platform: "YouTube",
+        formats: [
+          {
+            url: `https://www.youtube.com/watch?v=${item.videoId}`,
+            ext: "mp4",
+            type: "video",
+            label: "Fallback video",
+          },
+        ],
+        createdAt: Date.now(),
+      };
+      resolve(fallback);
+    } catch {
+      resolve(null);
+    }
+  });
 }
 
 function isStoryboard(f: any): boolean {
@@ -186,7 +223,7 @@ function toFormat(f: any): MediaFormat | null {
   };
 }
 
-export async function runYtDlp(url: string): Promise<any> {
+export async function runYtDlp(url: string, opts?: { cookies?: string; proxy?: string }): Promise<any> {
   const bin = await resolveBinary();
   return new Promise((resolve, reject) => {
     const args = [
@@ -200,8 +237,13 @@ export async function runYtDlp(url: string): Promise<any> {
       "--no-download",
       "--no-playlist",
       "--no-warnings",
-      url,
     ];
+    if (opts?.proxy) args.push("--proxy", opts.proxy);
+    if (opts?.cookies) {
+      args.push("--add-header", `Cookie:${opts.cookies}`);
+    }
+    args.push(url);
+
     const env = { ...process.env };
     const proc = spawn(bin, args, { env });
     let stdout = "";
@@ -251,7 +293,7 @@ export async function runYtDlp(url: string): Promise<any> {
       }
       try {
         resolve(JSON.parse(jsonLine));
-      } catch (e) {
+      } catch {
         reject(new Error("Failed to parse yt-dlp output"));
       }
     });
@@ -281,10 +323,11 @@ export function buildExtraction(id: string, sourceUrl: string, info: any): Extra
       if (f.type === "video") {
         s += 10000;
         if (f.hasAudio !== false) s += 100000;
+        if (f.ext === "mp4") s += 2000;
       }
       if (f.type === "image") s += 5000;
       if (f.height) s += f.height;
-      if (f.filesize) s += Math.min(f.filesize / 100000, 50);
+      if (f.filesize) s += 5000 + Math.min(f.filesize / 100000, 50);
       return s;
     };
     return score(b) - score(a);
@@ -388,7 +431,7 @@ export async function saveInfoJson(id: string, info: any): Promise<string | unde
   }
 }
 
-export async function spawnYtDlpStream(infoPath: string, formatId: string) {
+export async function spawnYtDlpStream(infoPath: string, formatId: string, proxy?: string, cookies?: string) {
   const bin = await resolveBinary();
   const args = [
     "--load-info-json",
@@ -403,6 +446,8 @@ export async function spawnYtDlpStream(infoPath: string, formatId: string) {
     "-o",
     "-",
   ];
+  if (proxy) args.push("--proxy", proxy);
+  if (cookies) args.push("--add-header", `Cookie:${cookies}`);
   const proc = spawn(bin, args, { env: { ...process.env } });
   return proc;
 }
@@ -425,4 +470,8 @@ export function buildDirectExtraction(id: string, sourceUrl: string): Extraction
     ],
     createdAt: Date.now(),
   };
+}
+
+export function getFfmpegPath(): string {
+  return String(ffmpegStatic || "/usr/bin/ffmpeg");
 }

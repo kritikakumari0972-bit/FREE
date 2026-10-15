@@ -12,7 +12,9 @@ export type MediaFormat = {
   hasAudio?: boolean;
   headers?: Record<string, string>;
   cookies?: string;
+  proxy?: string;
   formatId?: string;
+  needsMerge?: boolean;
 };
 
 export type Extraction = {
@@ -25,6 +27,8 @@ export type Extraction = {
   platform?: string;
   formats: MediaFormat[];
   infoPath?: string;
+  cookies?: string;
+  proxy?: string;
   createdAt: number;
 };
 
