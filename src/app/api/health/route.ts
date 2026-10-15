@@ -1,11 +1,10 @@
-import { requireDb } from "@/db";
+import { db } from "@/db";
 import { sql } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
-    const db = requireDb();
     await db.execute(sql`select 1`);
     return Response.json({ ok: true });
   } catch {

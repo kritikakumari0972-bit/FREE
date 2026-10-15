@@ -44,7 +44,7 @@ function ensureDir() {
   try {
     mkdirSync(DIR, { recursive: true });
   } catch {
-    // ignore
+    /* ignore */
   }
 }
 
@@ -54,7 +54,7 @@ export function saveExtraction(e: Extraction) {
     ensureDir();
     writeFileSync(path.join(DIR, `${e.id}.json`), JSON.stringify(e));
   } catch {
-    // ignore
+    /* ignore */
   }
 }
 
@@ -87,10 +87,10 @@ export function cleanupStore() {
         const e = JSON.parse(readFileSync(p, "utf8")) as Extraction;
         if (!e.createdAt || now - e.createdAt > ttl) unlinkSync(p);
       } catch {
-        // ignore
+        /* ignore */
       }
     }
   } catch {
-    // ignore
+    /* ignore */
   }
 }

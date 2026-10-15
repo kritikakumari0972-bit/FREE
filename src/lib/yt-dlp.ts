@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, chmodSync, createWriteStream } from "node:fs";
+import { existsSync, chmodSync, createWriteStream, copyFileSync } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -8,35 +8,38 @@ import type { Extraction, MediaFormat } from "./store";
 
 const YTDLP_RELEASE_URL =
   "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
-const FALLBACK_BIN = "/tmp/yt-dlp-bin";
+const TMP_BIN = "/tmp/yt-dlp";
 
 let resolvedBin: string | null = null;
 let downloadPromise: Promise<string> | null = null;
 
-function tryChmod(p: string) {
+function tryChmod(p: string): boolean {
   try {
     chmodSync(p, 0o755);
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function downloadBinary(): Promise<string> {
   if (!downloadPromise) {
     downloadPromise = (async () => {
-      const tmp = `${FALLBACK_BIN}.part`;
+      const part = `${TMP_BIN}.part-${Date.now()}`;
       const res = await fetch(YTDLP_RELEASE_URL, { redirect: "follow" });
       if (!res.ok || !res.body) {
         downloadPromise = null;
         throw new Error(`Failed to download yt-dlp binary (HTTP ${res.status})`);
       }
       try {
-        await pipeline(Readable.fromWeb(res.body as any), createWriteStream(tmp));
-        await rename(tmp, FALLBACK_BIN);
-        tryChmod(FALLBACK_BIN);
-        return FALLBACK_BIN;
+        await pipeline(Readable.fromWeb(res.body as any), createWriteStream(part));
+        await rename(part, TMP_BIN);
+        tryChmod(TMP_BIN);
+        return TMP_BIN;
       } catch (e) {
         downloadPromise = null;
         try {
-          await unlink(tmp);
+          await unlink(part);
         } catch {}
         throw e;
       }
@@ -45,22 +48,52 @@ async function downloadBinary(): Promise<string> {
   return downloadPromise;
 }
 
-async function resolveBinary(): Promise<string> {
-  if (resolvedBin && existsSync(resolvedBin)) return resolvedBin;
+/**
+ * On Vercel Serverless Functions:
+ * 1. The filesystem outside of `/tmp` is strictly READ-ONLY.
+ * 2. Bundled files in `./bin/yt-dlp` cannot be chmod'd in place.
+ * 3. Therefore, if a bundled candidate exists, we copy it to `/tmp/yt-dlp`
+ *    and chmod it there (where write + execute permissions exist).
+ */
+export async function resolveBinary(): Promise<string> {
+  if (resolvedBin && existsSync(resolvedBin)) {
+    return resolvedBin;
+  }
+
+  // Already staged in /tmp?
+  if (existsSync(TMP_BIN)) {
+    tryChmod(TMP_BIN);
+    resolvedBin = TMP_BIN;
+    return TMP_BIN;
+  }
+
   const candidates = [
     process.env.YTDLP_PATH,
     path.join(process.cwd(), "bin", "yt-dlp"),
-    FALLBACK_BIN,
+    path.join(__dirname, "..", "..", "bin", "yt-dlp"),
     "/usr/local/bin/yt-dlp",
   ].filter(Boolean) as string[];
+
   for (const c of candidates) {
     if (existsSync(c)) {
-      tryChmod(c);
-      resolvedBin = c;
-      return c;
+      // First try to chmod in place (works in normal Node environments)
+      if (tryChmod(c)) {
+        resolvedBin = c;
+        return c;
+      }
+      // If chmod failed (read-only filesystem on Vercel), copy to /tmp and chmod there
+      try {
+        copyFileSync(c, TMP_BIN);
+        tryChmod(TMP_BIN);
+        resolvedBin = TMP_BIN;
+        return TMP_BIN;
+      } catch {
+        /* try next */
+      }
     }
   }
 
+  // Fallback: download directly into /tmp at runtime
   const bin = await downloadBinary();
   resolvedBin = bin;
   return bin;
@@ -133,13 +166,11 @@ function toFormat(f: any): MediaFormat | null {
       headers[k] = String(v);
     }
   }
-
   const rawA = f?.acodec;
   let hasAudio: boolean | undefined;
   if (rawA === "none") hasAudio = false;
   else if (rawA == null || rawA === "null" || rawA === "") hasAudio = undefined;
   else hasAudio = true;
-
   return {
     formatId: f.format_id ? String(f.format_id) : undefined,
     url: String(f.url),
@@ -220,7 +251,7 @@ export async function runYtDlp(url: string): Promise<any> {
       }
       try {
         resolve(JSON.parse(jsonLine));
-      } catch {
+      } catch (e) {
         reject(new Error("Failed to parse yt-dlp output"));
       }
     });
@@ -249,12 +280,11 @@ export function buildExtraction(id: string, sourceUrl: string, info: any): Extra
       let s = 0;
       if (f.type === "video") {
         s += 10000;
-        if (f.hasAudio) s += 100000;
-        if (f.ext === "mp4") s += 2000;
+        if (f.hasAudio !== false) s += 100000;
       }
       if (f.type === "image") s += 5000;
       if (f.height) s += f.height;
-      if (f.filesize) s += 5000 + Math.min(f.filesize / 100000, 50);
+      if (f.filesize) s += Math.min(f.filesize / 100000, 50);
       return s;
     };
     return score(b) - score(a);
@@ -316,7 +346,6 @@ export function buildExtraction(id: string, sourceUrl: string, info: any): Extra
   }));
 
   const thumb = info?.thumbnail ? String(info.thumbnail) : undefined;
-
   const curated: MediaFormat[] = [...videos, ...audioPicks, ...imagePicks];
 
   if (thumb) {

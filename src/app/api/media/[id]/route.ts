@@ -108,7 +108,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
         const body = Readable.toWeb(proc.stdout) as unknown as ReadableStream;
         return new Response(body, { status: 200, headers: respHeaders });
       } catch {
-        // fall through
+        /* fall through */
       }
     }
     const code = upstream ? upstream.status : "network error";

@@ -5,6 +5,7 @@ import { saveExtraction, cleanupStore } from "@/lib/store";
 import { safeDownloadName } from "@/lib/filename";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 export const maxDuration = 300;
 
 export async function POST(req: Request) {
@@ -31,6 +32,7 @@ export async function POST(req: Request) {
 
   const id = randomUUID();
 
+  // Direct media URL fallback
   const ext = parsed.pathname.split(".").pop()?.toLowerCase() || "";
   const directMedia = ["mp4", "webm", "mkv", "mov", "mp3", "m4a", "jpg", "jpeg", "png", "webp", "gif"].includes(ext);
 

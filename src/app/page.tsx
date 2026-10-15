@@ -57,7 +57,13 @@ function fallbackName(title: string, ext: string) {
   return `${cleaned}.${(ext || "bin").replace(/^\./, "")}`;
 }
 
-function triggerAnchorDownload(href: string, filename: string) {
+/**
+ * Robust device download trigger:
+ * Creates an anchor with `download` attribute and clicks it.
+ * Browsers download directly from the server stream (disposition: attachment, octet-stream).
+ * This works on desktop, Android, and iOS Safari without holding entire 100MB+ video in RAM.
+ */
+function triggerBrowserDownload(href: string, filename: string) {
   const a = document.createElement("a");
   a.href = href;
   a.download = filename;
@@ -65,92 +71,17 @@ function triggerAnchorDownload(href: string, filename: string) {
   a.style.display = "none";
   document.body.appendChild(a);
   a.click();
-  a.remove();
-}
-
-async function saveToDevice(
-  url: string,
-  filename: string,
-  onProgress: (pct: number | null) => void
-) {
-  const res = await fetch(url, { credentials: "same-origin", cache: "no-store" });
-  if (!res.ok) {
-    let msg = `Download failed (${res.status})`;
+  // Keep element momentarily in DOM so browser registers the click
+  setTimeout(() => {
     try {
-      const j = await res.json();
-      if (j?.error) msg = j.error;
+      a.remove();
     } catch {
-      // ignore
+      /* ignore */
     }
-    throw new Error(msg);
-  }
-
-  const total = Number(res.headers.get("content-length") || 0);
-  const hinted = res.headers.get("X-Download-Filename");
-  const name = hinted || filename;
-
-  let blob: Blob;
-  if (!res.body) {
-    blob = await res.blob();
-  } else {
-    const reader = res.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let received = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) {
-        chunks.push(value);
-        received += value.byteLength;
-        onProgress(total > 0 ? Math.min(99, Math.round((received / total) * 100)) : null);
-      }
-    }
-    const parts = chunks as unknown as BlobPart[];
-    blob = new Blob(parts);
-  }
-
-  if (blob.size === 0) throw new Error("Empty file received");
-  if (blob.size < 120) {
-    const text = await blob.text();
-    try {
-      const j = JSON.parse(text) as { error?: string };
-      if (j?.error) throw new Error(j.error);
-    } catch (err) {
-      if (err instanceof SyntaxError) {
-        blob = new Blob([text]);
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  const w = window as Window & {
-    showSaveFilePicker?: (opts: { suggestedName: string }) => Promise<{
-      createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }>;
-    }>;
-  };
-
-  if (typeof w.showSaveFilePicker === "function") {
-    try {
-      const handle = await w.showSaveFilePicker({ suggestedName: name });
-      const writable = await handle.createWritable();
-      await writable.write(blob);
-      await writable.close();
-      onProgress(100);
-      return;
-    } catch (err: unknown) {
-      const nameErr = err instanceof Error ? err.name : "";
-      if (nameErr === "AbortError") return;
-    }
-  }
-
-  const objectUrl = URL.createObjectURL(blob);
-  triggerAnchorDownload(objectUrl, name);
-  setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
-  onProgress(100);
+  }, 1000);
 }
 
-type DlState = { key: string; pct: number | null; label: string } | null;
+type DlState = { key: string; label: string } | null;
 
 export default function HomePage() {
   const [url, setUrl] = useState("");
@@ -164,7 +95,7 @@ export default function HomePage() {
 
   function showToast(msg: string) {
     setToast(msg);
-    window.setTimeout(() => setToast(null), 3200);
+    window.setTimeout(() => setToast(null), 3500);
   }
 
   async function handleExtract(e?: React.FormEvent) {
@@ -207,27 +138,20 @@ export default function HomePage() {
     }
   }
 
-  async function handleDownload(fmt: FormatInfo, key: string) {
+  function handleDownload(fmt: FormatInfo, key: string) {
     if (!result) return;
     const filename = fmt.filename || fallbackName(result.title, fmt.ext);
     const href = `/api/media/${result.id}?i=${fmt.index}&download=1`;
     setError(null);
-    setDl({ key, pct: 0, label: "Starting…" });
-    try {
-      await saveToDevice(href, filename, (pct) => {
-        setDl({
-          key,
-          pct,
-          label: pct == null ? "Saving…" : pct >= 100 ? "Saved" : `Saving ${pct}%`,
-        });
-      });
-      setDl({ key, pct: 100, label: "Saved" });
-      showToast(`Saved ${filename} to your device`);
-      window.setTimeout(() => setDl(null), 1800);
-    } catch (err: unknown) {
+    setDl({ key, label: "Saving…" });
+    
+    // Trigger download through native browser flow (direct file stream)
+    triggerBrowserDownload(href, filename);
+
+    showToast(`Downloading ${filename} to your device…`);
+    window.setTimeout(() => {
       setDl(null);
-      setError(err instanceof Error ? err.message : "Download failed");
-    }
+    }, 1200);
   }
 
   const mediaSrc = result ? `/api/media/${result.id}?i=${formatIndex}` : "";
@@ -236,8 +160,6 @@ export default function HomePage() {
   const thumbFormat = result?.formats.find(
     (f) => f.type === "image" && f.label.toLowerCase().startsWith("thumbnail")
   );
-
-  const downloading = Boolean(dl && dl.pct !== 100);
 
   const chips = useMemo(
     () =>
@@ -266,14 +188,14 @@ export default function HomePage() {
         <header className="mb-10 text-center fade-up">
           <div className="mx-auto mb-4 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-indigo-200">
             <span className="pulse-dot h-2 w-2 rounded-full bg-emerald-400" />
-            Live preview · real file save
+            Live preview · real file save · Vercel ready
           </div>
           <h1 className="gradient-title text-4xl font-extrabold tracking-tight sm:text-5xl">
             PulseFetch
           </h1>
           <p className="mx-auto mt-3 max-w-xl text-sm text-slate-300 sm:text-base">
             Paste a YouTube, TikTok, Instagram, Facebook, Pinterest or Snapchat link.
-            Watch it here, then save video, audio or the thumbnail to your device.
+            Watch it here, then save video, audio or the thumbnail directly to your device.
           </p>
         </header>
 
@@ -390,8 +312,8 @@ export default function HomePage() {
                     label={`Save ${selected.label}`}
                     tone="emerald"
                     busy={dl?.key === "main"}
-                    pct={dl?.key === "main" ? dl.pct : null}
-                    disabled={downloading}
+                    downloadHref={`/api/media/${result.id}?i=${selected.index}&download=1`}
+                    downloadName={selected.filename || fallbackName(result.title, selected.ext)}
                     onClick={() => handleDownload(selected, "main")}
                   />
                 )}
@@ -400,8 +322,8 @@ export default function HomePage() {
                     label="Save audio"
                     tone="fuchsia"
                     busy={dl?.key === "audio"}
-                    pct={dl?.key === "audio" ? dl.pct : null}
-                    disabled={downloading}
+                    downloadHref={`/api/media/${result.id}?i=${audioFormat.index}&download=1`}
+                    downloadName={audioFormat.filename || fallbackName(result.title, audioFormat.ext)}
                     onClick={() => handleDownload(audioFormat, "audio")}
                   />
                 )}
@@ -410,8 +332,8 @@ export default function HomePage() {
                     label="Save thumbnail"
                     tone="sky"
                     busy={dl?.key === "thumb"}
-                    pct={dl?.key === "thumb" ? dl.pct : null}
-                    disabled={downloading}
+                    downloadHref={`/api/media/${result.id}?i=${thumbFormat.index}&download=1`}
+                    downloadName={thumbFormat.filename || fallbackName(result.title, thumbFormat.ext)}
                     onClick={() => handleDownload(thumbFormat, "thumb")}
                   />
                 )}
@@ -427,7 +349,7 @@ export default function HomePage() {
                 </button>
               </div>
               <p className="text-xs text-slate-400">
-                Files save to your Downloads folder (or the location you pick in the save dialog).
+                Clicking Save downloads the file directly to your device (Downloads folder).
               </p>
             </div>
           </section>
@@ -439,10 +361,7 @@ export default function HomePage() {
       </div>
 
       {toast && (
-        <div
-          className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full border border-emerald-400/30 bg-emerald-500/20 px-5 py-2 text-sm text-emerald-50 shadow-xl backdrop-blur-md"
-          style={{ animation: "toast-in 0.35s ease both" }}
-        >
+        <div className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-full border border-emerald-400/30 bg-emerald-500/20 px-5 py-2 text-sm text-emerald-50 shadow-xl backdrop-blur-md" style={{ animation: "toast-in 0.35s ease both" }}>
           {toast}
         </div>
       )}
@@ -454,15 +373,15 @@ function SaveButton({
   label,
   tone,
   busy,
-  pct,
-  disabled,
+  downloadHref,
+  downloadName,
   onClick,
 }: {
   label: string;
   tone: "emerald" | "fuchsia" | "sky";
   busy: boolean;
-  pct: number | null;
-  disabled: boolean;
+  downloadHref: string;
+  downloadName: string;
   onClick: () => void;
 }) {
   const tones = {
@@ -470,29 +389,22 @@ function SaveButton({
     fuchsia: "from-fuchsia-500 to-pink-400 shadow-fuchsia-500/30",
     sky: "from-sky-500 to-cyan-400 shadow-sky-500/30",
   };
-  const text =
-    busy && pct != null && pct >= 100
-      ? "Saved"
-      : busy && pct != null
-        ? `${pct}%`
-        : busy
-          ? "Saving…"
-          : label;
 
   return (
-    <button
-      type="button"
-      disabled={disabled && !busy}
-      onClick={onClick}
-      className={`btn-glow relative inline-flex min-w-[9.5rem] items-center justify-center overflow-hidden rounded-2xl bg-gradient-to-r ${tones[tone]} px-5 py-2.5 font-semibold text-white shadow-lg disabled:opacity-50`}
+    <a
+      href={downloadHref}
+      download={downloadName}
+      onClick={(e) => {
+        // Trigger UI feedback
+        onClick();
+        // Allow the default browser download navigation to proceed!
+      }}
+      className={`btn-glow relative inline-flex min-w-[9.5rem] items-center justify-center overflow-hidden rounded-2xl bg-gradient-to-r ${tones[tone]} px-5 py-2.5 font-semibold text-white shadow-lg cursor-pointer transition hover:opacity-95`}
     >
-      {busy && (
-        <span
-          className="progress-fill absolute inset-y-0 left-0 bg-white/25"
-          style={{ width: `${pct ?? 35}%` }}
-        />
-      )}
-      <span className="relative z-10">{text}</span>
-    </button>
+      <span className="relative z-10 flex items-center gap-1.5">
+        <span>⬇</span>
+        <span>{busy ? "Starting…" : label}</span>
+      </span>
+    </a>
   );
 }
